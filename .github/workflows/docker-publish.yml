@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - next
+  workflow_dispatch:
 
 jobs:
   # Prepare metadata and tags for all builds
@@ -67,12 +68,12 @@ jobs:
             VERSION="${TAG#v}"
             MAJOR=$(echo "$VERSION" | cut -d. -f1)
             MINOR=$(echo "$VERSION" | cut -d. -f2)
-            TAGS="${VERSION},${MAJOR}.${MINOR},${MAJOR},latest"
+            TAGS="${VERSION},${MAJOR}.${MINOR},${MAJOR},latest,next"
             echo "Building RELEASE with tags: $TAGS"
           else
             # Regular commit: use SHA tags only (no latest)
             SHORT_SHA="${GITHUB_SHA:0:7}"
-            TAGS="sha-${SHORT_SHA}"
+            TAGS="sha-${SHORT_SHA},next"
             echo "Building COMMIT with tags: $TAGS"
           fi
           echo "tags=$TAGS" >> $GITHUB_OUTPUT
