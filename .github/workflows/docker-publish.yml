@@ -60,7 +60,7 @@ jobs:
       - name: Compute tags
         id: tags
         run: |
-          IMAGE="ghcr.io/${{ github.repository }}"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}"
 
           if [[ "${{ steps.check-release.outputs.is_release }}" == "true" ]]; then
             # This is a release: use semver tags + latest
