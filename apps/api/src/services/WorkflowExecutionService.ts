@@ -18,9 +18,14 @@ import {prisma} from '../database/prisma.js';
 import {HttpException} from '../exceptions/index.js';
 import {DASHBOARD_URI} from '../app/constants.js';
 
+import {ContactFieldService} from './ContactFieldService.js';
 import {EmailService} from './EmailService.js';
 import {NtfyService} from './NtfyService.js';
 import {QueueService} from './QueueService.js';
+
+// A step's error is rethrown through the catch of every step before it in the same run, which
+// had completed; the step it came from has handled it, so those pass it up untouched.
+const handledFailures = new WeakSet<object>();
 
 type StepConfig = Prisma.JsonValue;
 type StepResult = Record<string, unknown>;
@@ -209,6 +214,9 @@ export class WorkflowExecutionService {
       signale.info(`[WORKFLOW] Updated existing step execution ${stepExecution.id} to RUNNING`);
     }
 
+    // True once the step itself has completed: an error after that comes from moving on from it
+    let stepCompleted = false;
+
     try {
       // Execute the step based on its type
       signale.info(`[WORKFLOW] Executing step ${stepId} of type ${step.type}`);
@@ -249,19 +257,31 @@ export class WorkflowExecutionService {
           output: result ? toPrismaJson(result) : undefined,
         },
       });
+      stepCompleted = true;
 
       // Determine next step(s) based on transitions and conditions
       await this.processNextSteps(execution, step, result);
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      // Pass up untouched an error a later step of this run already handled. An error of this step
+      // itself is always handled, even one another execution it resumed through an event already
+      // handled: this step failed too.
+      const isObject = typeof error === 'object' && error !== null;
+      if (stepCompleted && isObject && handledFailures.has(error)) {
+        throw error;
+      }
+      if (isObject) {
+        handledFailures.add(error);
+      }
+
       signale.error(`[WORKFLOW] Error executing step ${step.id}:`, error);
-      // Mark step as failed
+      // Mark step as failed, unless it completed: then moving on from it is what failed, and the
+      // step keeps its result with the error
       await prisma.workflowStepExecution.update({
         where: {id: stepExecution.id},
-        data: {
-          status: StepExecutionStatus.FAILED,
-          completedAt: new Date(),
-          error: error instanceof Error ? error.message : 'Unknown error',
-        },
+        data: stepCompleted
+          ? {error: message}
+          : {status: StepExecutionStatus.FAILED, completedAt: new Date(), error: message},
       });
 
       // Mark workflow execution as failed
@@ -292,7 +312,7 @@ export class WorkflowExecutionService {
         failedExecution.workflow.project.name,
         failedExecution.workflow.project.id,
         failedExecution.contact.email,
-        error instanceof Error ? error.message : 'Unknown error',
+        message,
       );
 
       throw error;
@@ -333,9 +353,9 @@ export class WorkflowExecutionService {
       return;
     }
 
-    // Mark step as completed with timeout
-    await prisma.workflowStepExecution.update({
-      where: {id: stepExecution.id},
+    // Mark step as completed with timeout, unless the event claimed the wait since it was read
+    const {count} = await prisma.workflowStepExecution.updateMany({
+      where: {id: stepExecution.id, status: StepExecutionStatus.WAITING},
       data: {
         status: StepExecutionStatus.COMPLETED,
         completedAt: new Date(),
@@ -350,6 +370,10 @@ export class WorkflowExecutionService {
         },
       },
     });
+
+    if (count === 0) {
+      return;
+    }
 
     // Continue workflow - find transitions with timeout/fallback logic
     const transitions = stepExecution.step.outgoingTransitions || [];
@@ -483,9 +507,12 @@ export class WorkflowExecutionService {
       const config = stepExecution.step.config;
 
       if (config && typeof config === 'object' && 'eventName' in config && config.eventName === eventName) {
-        // Event matches, resume execution
-        await prisma.workflowStepExecution.update({
-          where: {id: stepExecution.id},
+        // Event matches. Claim the wait before resuming it: the list above can be stale by now,
+        // as the same event may be delivered twice at once (SES notifications, repeated clicks)
+        // or tracked again while an earlier wait of this loop was resumed. Whoever moves the
+        // step out of WAITING resumes it; everyone else leaves it alone.
+        const {count} = await prisma.workflowStepExecution.updateMany({
+          where: {id: stepExecution.id, status: StepExecutionStatus.WAITING},
           data: {
             status: StepExecutionStatus.COMPLETED,
             completedAt: new Date(),
@@ -497,8 +524,18 @@ export class WorkflowExecutionService {
           },
         });
 
-        // Cancel any pending timeout job
-        await QueueService.cancelWorkflowTimeout(stepExecution.id);
+        if (count === 0) {
+          continue;
+        }
+
+        // Cancel any pending timeout job. Best effort: a timeout job that is already running
+        // cannot be removed, and it will find the wait claimed and stop. Failing here would
+        // leave the claimed execution with nobody to move it on.
+        try {
+          await QueueService.cancelWorkflowTimeout(stepExecution.id);
+        } catch (error) {
+          signale.warn(`[WORKFLOW] Could not cancel the timeout of step execution ${stepExecution.id}:`, error);
+        }
 
         // Continue workflow
         await this.processNextSteps(stepExecution.execution, stepExecution.step, {eventReceived: true});
@@ -1211,6 +1248,10 @@ export class WorkflowExecutionService {
       });
     }
 
+    if (hasDataUpdates) {
+      await ContactFieldService.recordKeys(execution.workflow.projectId, Object.keys(newData));
+    }
+
     if (subscriptionChanging) {
       const {EventService} = await import('./EventService.js');
       await EventService.trackEvent(
@@ -1345,7 +1386,7 @@ export class WorkflowExecutionService {
   /**
    * Helper: Resolve field value from object using dot notation
    */
-  private static resolveField(field: string, data: Record<string, unknown>): unknown {
+  public static resolveField(field: string, data: Record<string, unknown>): unknown {
     // Handle legacy "contact.data.X" format by converting to "data.X"
     // The UI historically showed examples like "contact.data.plan" but the field structure
     // has "data" as a top-level key, not nested under "contact"
