@@ -148,7 +148,11 @@ export function DashboardLayout({children}: DashboardLayoutProps) {
             {sortedProjects.map(project => (
               <DropdownMenuItem
                 key={project.id}
-                onSelect={() => setActiveProject(project)}
+                onSelect={() => {
+                  setActiveProject(project);
+                  // The global view is not scoped to a project: leaving it for the project's dashboard
+                  if (inGlobalView) void router.push('/');
+                }}
                 className="gap-2 px-3 py-2 cursor-pointer"
               >
                 <div className="h-6 w-6 rounded-md bg-neutral-100 text-neutral-700 flex items-center justify-center text-xs font-medium flex-shrink-0">
